@@ -1,0 +1,123 @@
+FreelanceOS - Learning Notes
+(reference notes on concepts as I learn them - updated each session)
+================================================================
+
+2026-08-02
+----------
+
+SQLAlchemy core pieces:
+- engine: connection pool to the DB, built once from a DB URL via create_engine(url). Lazy - doesn't
+  actually connect until something uses it.
+- Session: one "conversation" with the DB (tracks loaded/changed objects, commits/rolls back as a unit).
+  Don't create directly - use a factory.
+- sessionmaker(bind=engine): factory that produces Session objects. autocommit=False, autoflush=False
+  is the standard default (don't write to DB until .commit() is called explicitly).
+- Base (declarative_base() or class Base(DeclarativeBase)): base class every ORM model inherits from,
+  so SQLAlchemy knows to map the class to a table.
+- get_db() pattern for FastAPI:
+    def get_db():
+        db = SessionLocal()
+        try:
+            yield db
+        finally:
+            db.close()
+  FastAPI runs the code before yield, hands the route the value, then runs the code after yield
+  once the route is done - guarantees cleanup even on exceptions.
+
+Model definition (SQLAlchemy 2.0 style):
+    class User(Base):
+        __tablename__ = "users"
+        id: Mapped[int] = mapped_column(primary_key=True)
+        email: Mapped[str] = mapped_column(String, unique=True, index=True)
+    Mapped[...] + mapped_column(...) is the modern typed style. unique=True enforces no duplicates
+    at the DB level. index=True speeds up lookups (important for anything queried often, like email
+    on login).
+
+create_all() vs migrations:
+    Base.metadata.create_all(bind=engine) only creates tables that don't exist yet. It will NOT alter
+    an existing table if the model changes (e.g. adding a column). That's what Alembic is for.
+
+Alembic:
+    alembic init alembic          -> scaffolds alembic.ini + alembic/env.py + alembic/versions/
+    env.py needs:
+      - target_metadata = Base.metadata  (so it knows what tables *should* exist)
+      - the actual model files imported (e.g. `from models.user import User`) - metadata is empty
+        until a model class has actually executed once
+      - the DB URL, either from alembic.ini or overridden at runtime via
+        config.set_main_option("sqlalchemy.url", ...)
+    alembic revision --autogenerate -m "message"   -> diffs models against live DB, writes a migration
+    alembic upgrade head                            -> applies pending migrations
+    Migration file has upgrade() and downgrade() - downgrade is the reverse operation, for rollback.
+    Gotcha: adding a NOT NULL column with no default fails if the table already has rows (nothing to
+    fill existing rows with). Need nullable=True, a server_default, or a backfill step.
+
+Password hashing:
+    Never store plaintext passwords. Hash with bcrypt (one-way - can verify, can't reverse). bcrypt
+    auto-salts, so the same password hashed twice gives different output (defeats rainbow tables).
+    passlib.context.CryptContext(schemes=["bcrypt"], deprecated="auto") wraps this.
+    .hash(password) -> hash string to store
+    .verify(password, hashed) -> True/False
+    Bug hit: passlib 1.7.4 + bcrypt 5.0.0 don't get along (passlib's version-detection code references
+    an attribute bcrypt 5.x removed). Symptom was a totally unrelated-looking error about 72-byte
+    password limits. Fix: pin bcrypt==4.0.1 in requirements.txt. Lesson - weird errors can come from
+    dependency version mismatches, not just your own code.
+
+Pydantic schemas (v2):
+    Separate from SQLAlchemy models on purpose. Models = DB shape. Schemas = API input/output shape.
+    UserCreate: what registration accepts (plaintext password field, not hashed_password)
+    UserOut: what gets sent back - deliberately excludes hashed_password. Since Pydantic only reads
+      fields you explicitly declared on the schema, it can't leak fields that aren't declared, even
+      if you pass in an object that has them.
+    UserLogin: email + password for login.
+    class Config: from_attributes = True (Pydantic v2) - needed when building a schema from an object's
+      *attributes* (like a SQLAlchemy row: user.id, user.email) instead of a dict. Without it,
+      UserOut.model_validate(some_orm_object) fails. Old v1 name was orm_mode - don't use that in v2,
+      it's silently ignored.
+
+Architecture pattern (used throughout the project):
+    routes -> services -> repositories
+    - routes: parse/validate the HTTP request, call a service, return a response. No logic.
+    - services: the actual business logic (e.g. "hash the password", "check email isn't taken").
+    - repositories: raw DB queries only, no logic. Reusable, dumb, testable in isolation.
+
+Repository layer (repositories/user.py):
+    get_user_by_email(db, email) -> User | None
+        db.query(User).filter(User.email == email).first()
+        .filter() with a model column uses == overloaded to build SQL WHERE, not a python compare.
+        .first() -> match or None.
+    create_user(db, email, hashed_password, full_name) -> User
+        user = User(...)
+        db.add(user)      # stage in session, not written yet
+        db.commit()        # write to Postgres
+        db.refresh(user)   # reload from DB so id/created_at (DB-generated) are populated on the object
+        return user
+    Why repositories stay "dumb" (no business rules inside them):
+        if create_user also checked for duplicate emails, every other caller (bulk import script,
+        test fixtures, etc.) would be forced into that rule too, and the actual rule would be
+        scattered across files instead of living in one place (the service).
+
+Service layer (services/user.py):
+    register_user(db, user_create: UserCreate) -> User
+        1. existing = get_user_by_email(db, user_create.email)
+        2. if existing: raise ValueError("Email already registered")
+        3. hashed = hash_password(user_create.password)
+        4. return create_user(db, user_create.email, hashed, user_create.full_name)
+    Raised a plain ValueError instead of FastAPI's HTTPException directly - keeps the service layer
+    framework-agnostic (doesn't need to import fastapi at all). The route layer will catch this and
+    translate it into a real HTTP error response.
+
+Type hints (e.g. `-> User` on a function signature):
+    Python does NOT enforce these at runtime - a function typed `-> User` could still `return None`
+    and nothing would stop it at the moment it runs. They're for tooling:
+    - editor autocomplete/hover knows what fields exist on the return value
+    - a type checker (mypy, editor's built-in one) can flag a wrong return type before running anything,
+      instead of surfacing as a confusing AttributeError later when something calls .field on the
+      wrong type
+    Basically free correctness-checking, no runtime cost, worth using consistently.
+
+Testing repo/service functions directly (without a route yet):
+    Can call them straight from a python -c script using a real SessionLocal():
+        from database import SessionLocal
+        db = SessionLocal()
+        ... call functions, print results, db.close()
+    Useful for proving something works end-to-end against real Postgres before the HTTP layer exists.
