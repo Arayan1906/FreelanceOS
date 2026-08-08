@@ -121,3 +121,69 @@ Testing repo/service functions directly (without a route yet):
         db = SessionLocal()
         ... call functions, print results, db.close()
     Useful for proving something works end-to-end against real Postgres before the HTTP layer exists.
+
+2026-08-08
+----------
+
+FastAPI routing (api/auth.py):
+    APIRouter() - a mini sub-app. Defined separately from the main `app`, then mounted onto it.
+    app.include_router(router, prefix="/auth", tags=["auth"]) in main.py:
+        - prefix: every route in this router gets prepended, e.g. /register -> /auth/register
+        - tags: groups routes together in the auto-generated /docs UI
+    A Pydantic model used as a plain parameter (not Depends(...)) is read from the request body and
+    auto-validated, e.g. `def register(user_create: UserCreate, ...)`.
+    Depends(get_db) - FastAPI calls get_db(), runs the route with the yielded session, then resumes
+    get_db() after the route returns to close it (works even if the route raises).
+    response_model=UserOut on the decorator - filters whatever the route returns through UserOut
+    before serializing, even if the actual returned object (e.g. a raw User row) has extra fields
+    like hashed_password. Structural guarantee, not just convention.
+    ValueError -> HTTPException translation happens in the route, not the service:
+        try: ... except ValueError as e: raise HTTPException(status_code=400, detail=str(e))
+    Status code choice matters: 400 = bad/malformed request (e.g. duplicate email on register),
+    401 = not authenticated (e.g. wrong password on login). Different semantic meaning.
+    Pydantic validation (e.g. EmailStr rejecting a bad email) happens before the route function even
+    runs - returns 422 Unprocessable Entity automatically, not something to catch manually.
+
+JWTs (JSON Web Tokens):
+    Why: HTTP is stateless - server doesn't remember previous requests. A JWT is a signed blob the
+    client stores and resends (Authorization: Bearer <token>), letting the server verify "this is a
+    legit request from an authenticated user" via signature check alone - no DB lookup or server-side
+    session storage needed.
+    Structure: header.payload.signature (all base64). Payload is just claims (data), NOT encrypted -
+    anyone can decode and read it, they just can't forge or modify it without invalidating the
+    signature (since they don't have SECRET_KEY). Don't put secrets in the payload.
+    python-jose library:
+        jwt.encode(payload_dict, SECRET_KEY, algorithm="HS256") -> token string
+        jwt.decode(token, SECRET_KEY, algorithms=["HS256"]) -> payload dict (raises if signature
+            invalid or "exp" has passed)
+    Standard claims used: "sub" (subject - who the token is about, e.g. user's email), "exp"
+    (expiration - unix timestamp; jose enforces this automatically on decode).
+    create_access_token(data: dict) pattern:
+        to_encode = data.copy()              # don't mutate caller's dict
+        to_encode.update({"exp": expire})     # expire = now (UTC) + timedelta(minutes=30)
+        return jwt.encode(to_encode, SECRET_KEY, algorithm="HS256")
+    HS256 = HMAC-SHA256, symmetric signing (same SECRET_KEY signs and verifies). Fine for a single
+    backend service; asymmetric (RS256) matters more with multiple services verifying tokens without
+    all holding the signing key.
+    Token response shape (OAuth2 convention): {"access_token": "<jwt>", "token_type": "bearer"} -
+    token_type tells the client how to send it back (Authorization: Bearer <token>).
+
+authenticate_user() pattern (services/user.py):
+    1. user = get_user_by_email(db, email); if not user: raise ValueError(...)
+    2. if not verify_password(plain, user.hashed_password): raise ValueError(...)
+    3. return user
+    Both failure cases raise the SAME error message ("Invalid email or password"). Deliberate -
+    if "no such user" and "wrong password" had different messages, an attacker could enumerate
+    which emails are registered just by trying logins. Same principle as generic login failure
+    messages on any real auth system.
+    Bug caught during this session: wrote `return ValueError(...)` instead of `raise ValueError(...)`
+    on the first pass. `return`ing an exception just hands it back as a normal value - doesn't stop
+    execution, doesn't get caught by `except ValueError`. Caller would've received a ValueError
+    object where it expected a User, and blown up somewhere unrelated later (e.g. calling .email on
+    it). Looks like a typo but is a real control-flow bug - worth double-checking raise vs return
+    whenever writing error paths.
+
+Manually decoding a JWT to verify it (useful for testing before a protected route exists to do it):
+    from jose import jwt
+    jwt.decode(token, SECRET_KEY, algorithms=["HS256"])  # -> {"sub": ..., "exp": ...}
+    Confirms signature is valid and expiry is set correctly, without needing a route that consumes it.
